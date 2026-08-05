@@ -1,6 +1,13 @@
+import os
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
-from src.config import VERIFY_TOKEN
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Pulls from Render environment variables or falls back to default
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "vector_secret_2026")
 
 app = FastAPI(title="WhatsApp Site Fault Logger")
 
@@ -30,17 +37,19 @@ async def verify_webhook(request: Request):
 @app.post("/webhook")
 async def receive_message(request: Request):
     """
-    Receives incoming WhatsApp messages (Text, Images, Documents, Fault Reports).
+    Receives incoming WhatsApp messages.
     """
     try:
         body = await request.json()
         print("\n📥 --- INCOMING WHATSAPP PAYLOAD ---")
         print(body)
         print("------------------------------------\n")
-
-        # Meta requires an immediate 200 OK response
         return {"status": "success"}
 
     except Exception as e:
         print(f"❌ Error handling payload: {e}")
         return {"status": "error"}
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
