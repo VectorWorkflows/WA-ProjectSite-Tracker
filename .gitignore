@@ -1,0 +1,15 @@
+# Environment variables (NEVER COMMIT THIS)
+.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# IDE / OS Files
+.DS_Store
+.vscode/
+.idea/
