@@ -5,6 +5,7 @@ import json
 import requests
 import uvicorn
 import gspread
+import certifi
 import pymongo
 import google.generativeai as genai
 from fastapi import FastAPI, Request, HTTPException
@@ -28,8 +29,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI(title="WhatsApp Site Fault Logger")
 
+
 # --- INITIALIZE MONGODB ---
-mongo_client = pymongo.MongoClient(MONGODB_URI)
+mongo_client = pymongo.MongoClient(MONGODB_URI, tlsCAFile=certifi.where())
 db = mongo_client["wa_logger_db"]
 users_collection = db["users"]
 
