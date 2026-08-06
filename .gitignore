@@ -1,6 +1,6 @@
 # Environment variables (NEVER COMMIT THIS)
 .env
-
+credentials.json
 # Python Bytecode & Cache
 __pycache__/
 *.py[cod]
@@ -13,3 +13,4 @@ ENV/
 .DS_Store
 .vscode/
 .idea/
+
