@@ -95,16 +95,17 @@ def upload_to_drive(drive_service, file_bytes: bytes, filename: str) -> str:
     
     return uploaded_file.get("webViewLink")
 
-def log_to_sheet(phone: str, text: str, photo_url: str = "N/A"):
-    """Appends the formatted row into Google Sheets."""
+def log_to_sheet(phone: str, text: str, photo_url: str = "N/A") -> str:
+    """Appends the formatted row into Google Sheets and returns the Sheet URL."""
     gc, _ = get_google_services()
-    sheet = gc.open(GOOGLE_SHEET_NAME).sheet1
+    spreadsheet = gc.open(GOOGLE_SHEET_NAME)
+    sheet = spreadsheet.sheet1
     
-    # Generate timestamp in IST/Local format
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Append the row exactly matching our columns
     sheet.append_row([timestamp, phone, text, photo_url, "Pending Review"])
+    
+    return spreadsheet.url
+
 
 # --- WEBHOOK ROUTES ---
 @app.get("/")
@@ -139,28 +140,33 @@ async def receive_message(request: Request):
                         _, drive_service = get_google_services()
 
                         # --- HANDLE TEXT MESSAGES ---
+                        # --- HANDLE TEXT MESSAGES ---
                         if msg["type"] == "text":
                             user_text = msg["text"]["body"]
-                            log_to_sheet(sender_phone, user_text)
-                            send_whatsapp_message(sender_phone, f"✅ Report logged to spreadsheet:\n\n\"{user_text}\"")
+                            sheet_url = log_to_sheet(sender_phone, user_text)
+                            send_whatsapp_message(
+                                sender_phone, 
+                                f"✅ Report logged to master sheet!\n\n📝 Note: \"{user_text}\"\n📊 View Sheet: {sheet_url}"
+                            )
 
                         # --- HANDLE IMAGES ---
                         elif msg["type"] == "image":
                             image_id = msg["image"]["id"]
-                            # Extract the text they typed with the photo (or default to a placeholder)
                             caption = msg["image"].get("caption", "No description provided.")
                             
-                            send_whatsapp_message(sender_phone, "📸 Receiving photo and generating report. Please wait a moment...")
+                            send_whatsapp_message(sender_phone, "📸 Uploading photo and updating master sheet...")
                             
-                            # Download & Upload
                             image_bytes = download_whatsapp_media(image_id)
                             filename = f"Site_Fault_{sender_phone}_{int(datetime.datetime.now().timestamp())}.jpg"
                             drive_link = upload_to_drive(drive_service, image_bytes, filename)
                             
-                            # Log to Sheets
-                            log_to_sheet(sender_phone, caption, drive_link)
-                            send_whatsapp_message(sender_phone, f"✅ Photo & report successfully logged!\n\nLink: {drive_link}")
-
+                            # Log to Sheets & get the sheet link
+                            sheet_url = log_to_sheet(sender_phone, caption, drive_link)
+                            
+                            send_whatsapp_message(
+                                sender_phone, 
+                                f"✅ Fault Report Logged!\n\n🖼️ Photo Link: {drive_link}\n📊 Master Sheet: {sheet_url}"
+                            )
         return {"status": "success"}
 
     except Exception as e:
