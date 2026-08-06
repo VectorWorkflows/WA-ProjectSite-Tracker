@@ -76,19 +76,21 @@ def upload_to_drive(drive_service, file_bytes: bytes, filename: str) -> str:
     }
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
     
-    # Upload the file
+    # Upload the file (Notice the supportsAllDrives=True parameter)
     uploaded_file = drive_service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, webViewLink"
+        fields="id, webViewLink",
+        supportsAllDrives=True
     ).execute()
     
     file_id = uploaded_file.get("id")
     
-    # Change permissions so anyone with the link can view it (otherwise it's locked to the Service Account)
+    # Change permissions so anyone with the link can view it
     drive_service.permissions().create(
         fileId=file_id,
-        body={"type": "anyone", "role": "reader"}
+        body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True
     ).execute()
     
     return uploaded_file.get("webViewLink")
