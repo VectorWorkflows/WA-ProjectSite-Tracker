@@ -43,7 +43,14 @@ genai.configure(api_key=GEMINI_API_KEY)
 # this uses a widely-available current name as of 2026.
 ai_model = genai.GenerativeModel(
     "gemini-2.0-flash",
-    generation_config={"response_mime_type": "application/json"},
+    generation_config={
+        "response_mime_type": "application/json",
+        # Deterministic output — this is a structured-extraction task, not a
+        # creative one. Letting temperature float is a big part of why the
+        # same kind of caption ("B2-506 Main, Master Bedroom, ...") could be
+        # split inconsistently run to run.
+        "temperature": 0,
+    },
 )
 
 # --- GOOGLE APIS SETUP ---
@@ -62,6 +69,18 @@ def get_google_services():
     gc = gspread.authorize(creds)
     drive_service = build("drive", "v3", credentials=creds)
     return gc, drive_service
+
+
+def display_name(user: dict) -> str:
+    """
+    Small helper so a genuinely-missing name always renders as
+    'Not specified' — including for legacy user docs that predate the
+    'name' field, where user['name'] may not exist at all, AND for docs
+    where it exists but is an empty string. `dict.get(key, default)` only
+    covers the first case; this covers both.
+    """
+    name = (user.get("name") or "").strip()
+    return name if name else "Not specified"
 
 
 # --- HELPER FUNCTIONS ---
@@ -134,81 +153,49 @@ def log_to_sheet(row_data: list) -> str:
     return sheet_url
 
 
-def extract_fault_details_with_ai(caption: str) -> dict:
+# --- LOCATION / FAULT SPLITTING ---
+#
+# Shared regex vocabulary for "this token is a location, not a fault", used
+# both by the pure-regex fallback AND as a backstop pass after the AI
+# extraction (see extract_fault_details_with_ai). Keeping ONE list means the
+# AI path and the no-AI path can never disagree about what counts as a
+# location.
+LOCATION_PATTERNS = [
+    # B-804, B2-506, A102-style codes, optionally followed by a qualifier
+    # word that's really still part of the location ("B2-506 Main",
+    # "B2-506 Phase 2", "B2-506 Annex") rather than the start of the fault.
+    r'\b[A-Za-z]\d?-\d{2,4}(?:\s+(?:Main|Annex|Extension|Phase\s*\d+))?\b',
+    r'\bTower\s+[A-Za-z0-9]+\b',                    # Tower C
+    r'\bBlock\s+[A-Za-z0-9]+\b',                    # Block B2
+    r'\bWing\s+[A-Za-z0-9]+\b',                     # Wing A
+    r'\bFlat\s*\d+\b',                              # Flat 12
+    r'\bUnit\s*\d+\b',                              # Unit 5
+    r'\b\d+(?:st|nd|rd|th)\s+Floor\b',              # 3rd Floor
+    r'\bGround\s+Floor\b',                          # Ground Floor
+    r'\bMaster\s+Bedroom\b|\bBedroom\s*\d*\b|\bKitchen\b|\bBathroom\b|'
+    r'\bBalcony\b|\bLiving\s+Room\b|\bDining\s+Room\b|\bTerrace\b|\bLobby\b|'
+    r'\bStaircase\b|\bCorridor\b|\bParking\b|\bBasement\b|\bTerrace\b',
+]
+
+
+def strip_known_locations(text: str):
     """
-    Uses Gemini (JSON mode) to split a free-text caption into a fault
-    location and a fault description. Falls back to a regex heuristic,
-    and only as a last resort dumps the raw caption into the description
-    (never silently blending the two).
+    Scans `text` for known location patterns (unit/flat codes, tower/block/
+    wing names, floor references, room names, etc.), removes them, and
+    cleans up whatever punctuation/connector words they leave behind.
+
+    Returns (found_locations: list[str], remaining_text: str).
+
+    This is used two ways:
+      1. As the entire fallback path when the AI call fails outright.
+      2. As a backstop AFTER a successful AI call, to catch any location
+         tokens the model left behind in fault_description instead of
+         moving to specific_area (this is exactly the "bedroom went to
+         location, but B2-506 Main stayed in the fault text" bug).
     """
-    fallback = {"specific_area": "Not specified", "fault_description": caption.strip() or "No description provided."}
-
-    if not caption or caption.strip().lower() in ("", "no description provided."):
-        return {"specific_area": "Not specified", "fault_description": "No description provided."}
-
-    prompt = f"""You extract structured data from short construction site fault reports.
-
-Split the report into:
-- "specific_area": the physical location only (unit/flat number, floor, room name, tower, etc). If none is mentioned, use "Not specified".
-- "fault_description": the issue itself, with the location phrase removed. Keep it concise, in the reporter's own words.
-
-Respond with ONLY a JSON object, no extra text, matching exactly:
-{{"specific_area": "...", "fault_description": "..."}}
-
-Examples:
-Report: "Ply coming off in B-804, Master Bedroom"
-{{"specific_area": "B-804, Master Bedroom", "fault_description": "Ply coming off"}}
-
-Report: "Leaking pipe near kitchen sink, Tower C 2nd floor"
-{{"specific_area": "Tower C, 2nd floor, kitchen", "fault_description": "Leaking pipe near sink"}}
-
-Report: "Paint peeling"
-{{"specific_area": "Not specified", "fault_description": "Paint peeling"}}
-
-Now extract from this report:
-"{caption}"
-"""
-
-    try:
-        response = ai_model.generate_content(prompt)
-        raw_text = response.text.strip()
-        data = json.loads(raw_text)
-
-        area = str(data.get("specific_area", "")).strip() or "Not specified"
-        fault = str(data.get("fault_description", "")).strip()
-
-        # Guard against the model echoing the whole caption into fault_description
-        # while leaving area genuinely findable — if area is "Not specified" but
-        # the fault text still contains an obvious unit/room pattern, try a regex
-        # backstop rather than trusting the AI blindly.
-        if not fault:
-            fault = fallback["fault_description"]
-
-        return {"specific_area": area, "fault_description": fault}
-
-    except Exception as e:
-        print(f"AI Parsing Error: {e} | raw response: {getattr(response, 'text', 'N/A') if 'response' in locals() else 'no response'}")
-        return regex_fallback_extract(caption)
-
-
-def regex_fallback_extract(caption: str) -> dict:
-    """
-    Lightweight non-AI backstop: looks for common location patterns like
-    'B-804', 'Tower C', 'Flat 12', 'Room 3', 'Floor 5', etc., strips them
-    out of the text, and returns what's left as the fault description.
-    """
-    location_patterns = [
-        r'\b[A-Za-z]-?\d{2,4}\b',                    # B-804, A102
-        r'\bTower\s+[A-Za-z0-9]+\b',                 # Tower C
-        r'\bFlat\s*\d+\b',                            # Flat 12
-        r'\bUnit\s*\d+\b',                            # Unit 5
-        r'\b\d+(?:st|nd|rd|th)\s+Floor\b',            # 3rd Floor
-        r'\bMaster Bedroom\b|\bBedroom\s*\d*\b|\bKitchen\b|\bBathroom\b|\bBalcony\b|\bLiving Room\b',
-    ]
-
     found = []
-    remaining = caption
-    for pattern in location_patterns:
+    remaining = text
+    for pattern in LOCATION_PATTERNS:
         matches = re.findall(pattern, remaining, flags=re.IGNORECASE)
         if matches:
             found.extend(matches)
@@ -231,10 +218,149 @@ def regex_fallback_extract(caption: str) -> dict:
         remaining = re.sub(r'\s*\b(in|at|near|on)\b\s*$', '', remaining, flags=re.IGNORECASE)        # trailing connector
         remaining = re.sub(r'\s{2,}', ' ', remaining).strip(" ,-")
 
+    return found, remaining
+
+
+def regex_fallback_extract(caption: str) -> dict:
+    """Pure non-AI backstop used when the Gemini call fails outright."""
+    found, remaining = strip_known_locations(caption)
     area = ", ".join(dict.fromkeys(found)) if found else "Not specified"  # dedupe, preserve order
     fault = remaining if remaining else caption.strip()
-
     return {"specific_area": area, "fault_description": fault}
+
+
+def extract_fault_details_with_ai(caption: str) -> dict:
+    """
+    Uses Gemini (JSON mode, temperature 0) to split a free-text caption into
+    a fault location and a fault description, then runs a regex backstop
+    over the result so any location fragments the model left inside
+    fault_description get pulled into specific_area instead of silently
+    staying put.
+    """
+    if not caption or caption.strip().lower() in ("", "no description provided."):
+        return {"specific_area": "Not specified", "fault_description": "No description provided."}
+
+    prompt = f"""You are a strict data-extraction engine for construction site fault reports sent by site workers over WhatsApp. You split ONE short, messy, informally-written caption into exactly two fields. You do not add commentary, do not guess facts that aren't in the text, and do not skip this step even when the caption looks simple — short captions are exactly where naive splitting goes wrong.
+
+Return ONLY a JSON object, nothing else (no markdown fences, no preamble, no trailing text), matching exactly this shape:
+{{"specific_area": "...", "fault_description": "..."}}
+
+DEFINITIONS
+
+"specific_area" = every phrase in the caption that answers WHERE the fault is. This includes, and you must actively scan for ALL of the following categories, even when several appear in the same caption:
+  - Unit / flat / apartment codes, in any format: "B2-506", "B-804", "A102", "Flat 12", "Unit 5"
+  - Tower / block / wing names: "Tower C", "Block B2", "Wing A", or a bare qualifier attached to a code like "B2-506 Main" (treat "Main" as part of the location when it modifies a tower/block/unit reference, not the fault)
+  - Floor references: "3rd Floor", "Ground Floor", "2nd floor"
+  - Room / area names: "Master Bedroom", "Bedroom 2", "Kitchen", "Bathroom", "Balcony", "Living Room", "Dining Room", "Terrace", "Lobby", "Staircase", "Corridor", "Parking", "Basement"
+
+"fault_description" = the actual defect/problem/issue being reported, and ONLY that — what is broken, damaged, leaking, missing, incomplete, or otherwise wrong. It must never contain a code, tower/block/wing name, floor reference, or room name from the categories above.
+
+CRITICAL RULES — read carefully, these are the rules that get violated most often:
+
+1. A single caption very often contains MULTIPLE location fragments at once (e.g. a unit code AND a tower name AND a room name, in any order, sometimes separated by commas, sometimes just run together). You must collect EVERY one of them into specific_area as a single combined string, in the order they appear, comma-separated. Do NOT stop after finding the first location fragment and do NOT leave any remaining location fragment behind in fault_description.
+   Example of the failure mode to avoid: caption "B2-506 Main, Master Bedroom, ply coming off near window" must NOT produce specific_area "Master Bedroom" while leaving "B2-506 Main" sitting inside fault_description. The correct specific_area is "B2-506 Main, Master Bedroom" and fault_description is "Ply coming off near window".
+
+2. Room names (Bedroom, Kitchen, Bathroom, etc.) are ALWAYS part of specific_area, never part of fault_description, even when they appear right next to the defect word (e.g. "kitchen leaking" -> area "Kitchen", fault "Leaking"; NOT area "Not specified", fault "Kitchen leaking").
+
+3. Unit/flat/tower codes are ALWAYS part of specific_area in full, exactly as written (don't reformat, abbreviate, or drop qualifier words next to them like "Main" or "Phase 2" when those words are clearly modifying the code/tower rather than describing the defect).
+
+4. After you remove every location fragment, fault_description must read as a grammatically clean, standalone description of the problem — no dangling connector words like a stray leading/trailing "in", "at", "near", "on", and no orphaned commas.
+
+5. If, and only if, no location information of any kind is present anywhere in the caption, use "Not specified" for specific_area — but double-check the whole caption first; do not default to "Not specified" just because the location isn't at the start of the sentence.
+
+6. Keep fault_description in the reporter's own words/phrasing (light cleanup only, e.g. capitalization and removing the location text) — do not rewrite or embellish the defect description.
+
+WORKED EXAMPLES
+
+Report: "Ply coming off in B-804, Master Bedroom"
+{{"specific_area": "B-804, Master Bedroom", "fault_description": "Ply coming off"}}
+
+Report: "B2-506 Main, Master Bedroom, ply coming off near window"
+{{"specific_area": "B2-506 Main, Master Bedroom", "fault_description": "Ply coming off near window"}}
+
+Report: "Leaking pipe near kitchen sink, Tower C 2nd floor"
+{{"specific_area": "Tower C, 2nd floor, kitchen", "fault_description": "Leaking pipe near sink"}}
+
+Report: "Tower B Flat 12 bathroom tiles cracked"
+{{"specific_area": "Tower B, Flat 12, bathroom", "fault_description": "Tiles cracked"}}
+
+Report: "kitchen leaking"
+{{"specific_area": "Kitchen", "fault_description": "Leaking"}}
+
+Report: "Paint peeling"
+{{"specific_area": "Not specified", "fault_description": "Paint peeling"}}
+
+Report: "A102 Tower A 3rd floor balcony railing loose, also door handle broken"
+{{"specific_area": "A102, Tower A, 3rd floor, balcony", "fault_description": "Railing loose, also door handle broken"}}
+
+Now extract from this report. Re-read it once looking specifically for any unit code, tower/block/wing name, floor, or room name you might have missed before writing your answer:
+"{caption}"
+"""
+
+    try:
+        response = ai_model.generate_content(prompt)
+        raw_text = response.text.strip()
+        # Strip markdown code fences defensively, in case the model wraps
+        # the JSON despite being told not to.
+        raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text.strip())
+        data = json.loads(raw_text)
+
+        area = str(data.get("specific_area", "")).strip() or "Not specified"
+        fault = str(data.get("fault_description", "")).strip() or caption.strip()
+
+        # --- Backstop pass ---
+        # Don't just trust the model's split. Re-scan whatever it put in
+        # fault_description for location patterns it may have missed or
+        # left half-stripped, and move anything found over to specific_area.
+        # This is what actually fixes the "bedroom went to area, B2-506
+        # Main stayed in the fault text" bug — even a perfect prompt can't
+        # guarantee zero misses from a probabilistic model, so we verify.
+        leftover_locations, cleaned_fault = strip_known_locations(fault)
+        if leftover_locations:
+            combined = [area] if area and area != "Not specified" else []
+            combined.extend(leftover_locations)
+            area = ", ".join(dict.fromkeys(combined))
+            fault = cleaned_fault if cleaned_fault else fault
+
+        return {"specific_area": area, "fault_description": fault}
+
+    except Exception as e:
+        print(f"AI Parsing Error: {e} | raw response: {getattr(response, 'text', 'N/A') if 'response' in locals() else 'no response'}")
+        return regex_fallback_extract(caption)
+
+
+# --- ONBOARDING / PROFILE COMPLETENESS ---
+#
+# name/project/site are collected once via the awaiting_name -> awaiting_project
+# -> awaiting_site chain. But a user can end up "active" without all three
+# actually being set — e.g. a legacy Mongo doc from before the "name" field
+# existed, or any future write that only partially completes. Rather than
+# silently logging "Not specified" forever, we check completeness before
+# treating the user as active and, if something's missing, collect it (and
+# ONLY it) before continuing.
+REQUIRED_FIELDS = [
+    ("name", "awaiting_name", "✏️ Before you continue, what's your *Full Name*?"),
+    ("project", "awaiting_project", "🏢 Before you continue, what is your *Project Name*? (e.g., Vector Heights)"),
+    ("site", "awaiting_site", "📍 Before you continue, what is the *Site Location*? (e.g., Tower B)"),
+]
+
+
+def start_missing_field_collection(sender_phone: str, user: dict) -> bool:
+    """
+    If name/project/site is missing or blank, switch the user into the
+    matching awaiting_* state (remembering to return to "active" afterwards,
+    NOT restart the whole onboarding chain), prompt for it, and return True.
+    Returns False if the profile is already complete.
+    """
+    for field, wait_state, prompt in REQUIRED_FIELDS:
+        if not (user.get(field) or "").strip():
+            users_collection.update_one(
+                {"phone": sender_phone},
+                {"$set": {"state": wait_state, "return_state": "active"}}
+            )
+            send_whatsapp_message(sender_phone, prompt)
+            return True
+    return False
 
 
 # --- WEBHOOK ROUTES ---
@@ -275,6 +401,7 @@ async def receive_message(request: Request):
                             user = {
                                 "phone": sender_phone,
                                 "state": "awaiting_name",
+                                "return_state": None,
                                 "name": "",
                                 "project": "",
                                 "site": ""
@@ -291,46 +418,72 @@ async def receive_message(request: Request):
                         if msg_type == "text":
                             user_text = msg["text"]["body"].strip()
 
-                            # The /update command — changes project/site, keeps name
+                            # The /update command — changes project/site ONLY, never name.
                             if user_text.lower() == "/update":
                                 users_collection.update_one(
-                                    {"phone": sender_phone}, {"$set": {"state": "awaiting_project"}}
+                                    {"phone": sender_phone},
+                                    {"$set": {"state": "awaiting_project", "return_state": None}}
                                 )
                                 send_whatsapp_message(sender_phone, "🔄 Location update initiated.\n\n🏢 What is the new *Project Name*?")
                                 return {"status": "success"}
 
                             # The /name command — lets a user correct/change their logged name
+                            # WITHOUT forcing them to redo project/site. return_state remembers
+                            # "active" so they land right back where they were.
                             if user_text.lower() == "/name":
                                 users_collection.update_one(
-                                    {"phone": sender_phone}, {"$set": {"state": "awaiting_name"}}
+                                    {"phone": sender_phone},
+                                    {"$set": {"state": "awaiting_name", "return_state": "active"}}
                                 )
                                 send_whatsapp_message(sender_phone, "✏️ What should we log your name as?")
                                 return {"status": "success"}
 
-                            # State: Awaiting Name (first-time setup or /name)
+                            # State: Awaiting Name (first-time setup, /name, or the
+                            # missing-field safety net)
                             if user["state"] == "awaiting_name":
-                                users_collection.update_one(
-                                    {"phone": sender_phone},
-                                    {"$set": {"name": user_text, "state": "awaiting_project"}}
-                                )
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    f"Thanks, *{user_text}*.\n\n🏢 What is your *Project Name*? (e.g., Vector Heights)"
-                                )
+                                return_state = user.get("return_state")
+                                if return_state == "active":
+                                    # Correcting/backfilling name only — go straight
+                                    # back to active, don't touch project/site.
+                                    users_collection.update_one(
+                                        {"phone": sender_phone},
+                                        {"$set": {"name": user_text, "state": "active", "return_state": None}}
+                                    )
+                                    send_whatsapp_message(sender_phone, f"✅ Name updated to *{user_text}*. You're all set to keep reporting.")
+                                else:
+                                    # Fresh onboarding — continue the chain to project.
+                                    users_collection.update_one(
+                                        {"phone": sender_phone},
+                                        {"$set": {"name": user_text, "state": "awaiting_project"}}
+                                    )
+                                    send_whatsapp_message(
+                                        sender_phone,
+                                        f"Thanks, *{user_text}*.\n\n🏢 What is your *Project Name*? (e.g., Vector Heights)"
+                                    )
                                 return {"status": "success"}
 
                             # State: Awaiting Project Name
                             if user["state"] == "awaiting_project":
-                                users_collection.update_one(
-                                    {"phone": sender_phone}, {"$set": {"project": user_text, "state": "awaiting_site"}}
-                                )
-                                send_whatsapp_message(sender_phone, f"Got it. Project set to *{user_text}*.\n\n📍 Now, what is the *Site Location*? (e.g., Tower B)")
+                                return_state = user.get("return_state")
+                                if return_state == "active":
+                                    users_collection.update_one(
+                                        {"phone": sender_phone},
+                                        {"$set": {"project": user_text, "state": "active", "return_state": None}}
+                                    )
+                                    send_whatsapp_message(sender_phone, f"✅ Project set to *{user_text}*. You're all set to keep reporting.")
+                                else:
+                                    users_collection.update_one(
+                                        {"phone": sender_phone},
+                                        {"$set": {"project": user_text, "state": "awaiting_site"}}
+                                    )
+                                    send_whatsapp_message(sender_phone, f"Got it. Project set to *{user_text}*.\n\n📍 Now, what is the *Site Location*? (e.g., Tower B)")
                                 return {"status": "success"}
 
                             # State: Awaiting Site Location
                             elif user["state"] == "awaiting_site":
                                 users_collection.update_one(
-                                    {"phone": sender_phone}, {"$set": {"site": user_text, "state": "active"}}
+                                    {"phone": sender_phone},
+                                    {"$set": {"site": user_text, "state": "active", "return_state": None}}
                                 )
                                 send_whatsapp_message(
                                     sender_phone,
@@ -342,6 +495,12 @@ async def receive_message(request: Request):
 
                             # State: Active (Sending text without photo)
                             elif user["state"] == "active":
+                                # Safety net: legacy/partial docs might be "active"
+                                # without name/project/site actually set. Catch it
+                                # here instead of silently logging "Not specified".
+                                if start_missing_field_collection(sender_phone, user):
+                                    return {"status": "success"}
+
                                 send_whatsapp_message(
                                     sender_phone,
                                     "📸 Please attach a photo when reporting a fault. You can type the description in the photo's caption!\n\n"
@@ -353,6 +512,16 @@ async def receive_message(request: Request):
                         elif msg_type == "image":
                             if user["state"] != "active":
                                 send_whatsapp_message(sender_phone, "⚠️ Please finish your setup first before sending photos.")
+                                return {"status": "success"}
+
+                            # Same safety net as above — don't log a report with a
+                            # missing name/project/site, ask for it first and have
+                            # the reporter resend the photo.
+                            if start_missing_field_collection(sender_phone, user):
+                                send_whatsapp_message(
+                                    sender_phone,
+                                    "Please resend the photo once you've replied above."
+                                )
                                 return {"status": "success"}
 
                             image_id = msg["image"]["id"]
@@ -378,7 +547,7 @@ async def receive_message(request: Request):
                                 sender_phone,
                                 user["project"],
                                 user["site"],
-                                user.get("name", "Not specified"),
+                                display_name(user),
                                 ai_data["specific_area"],
                                 ai_data["fault_description"],
                                 drive_link,
@@ -389,7 +558,7 @@ async def receive_message(request: Request):
                             # D. Send confirmation with BOTH the photo link and the sheet link
                             reply_msg = (
                                 f"✅ *Report Logged!*\n\n"
-                                f"🙋 *Logged by:* {user.get('name', 'Not specified')}\n"
+                                f"🙋 *Logged by:* {display_name(user)}\n"
                                 f"🏢 *Project:* {user['project']}\n"
                                 f"📍 *Site:* {user['site']}\n"
                                 f"🚪 *Fault Location:* {ai_data['specific_area']}\n"
