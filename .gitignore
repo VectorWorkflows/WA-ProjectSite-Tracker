@@ -9,6 +9,10 @@ __pycache__/
 venv/
 ENV/
 
+whatsapp-fault-tracker-5566dde578c3-creds.json
+
+wa logger users data cred.env
+
 # IDE / OS Files
 .DS_Store
 .vscode/

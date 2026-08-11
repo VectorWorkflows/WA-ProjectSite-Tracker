@@ -9,7 +9,7 @@ import gspread
 import certifi
 import pymongo
 import google.generativeai as genai
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
@@ -19,12 +19,15 @@ from googleapiclient.http import MediaIoBaseUpload
 
 load_dotenv()
 
+import database          # noqa: E402  (local module, imported after load_dotenv)
+import sheets_service   # noqa: E402  (local module, imported after load_dotenv)
+
 # --- ENVIRONMENT VARIABLES ---
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "vector_secret_2026")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Site Fault Reports")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # legacy; photo uploads now use sheets_service.PHOTOS_FOLDER_ID
 MONGODB_URI = os.getenv("MONGODB_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -94,9 +97,11 @@ def download_whatsapp_media(media_id: str) -> bytes:
     return media_res.content
 
 def upload_to_drive(drive_service, file_bytes: bytes, filename: str) -> str:
+    # Use PHOTOS_FOLDER_ID from sheets_service so all fault images land in the Photos folder.
+    photos_folder = sheets_service.PHOTOS_FOLDER_ID or DRIVE_FOLDER_ID
     file_metadata = {
         "name": filename,
-        "parents": [DRIVE_FOLDER_ID] if DRIVE_FOLDER_ID else []
+        "parents": [photos_folder] if photos_folder else []
     }
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
     uploaded_file = drive_service.files().create(
@@ -240,6 +245,203 @@ def start_missing_field_collection(sender_phone: str, user: dict) -> bool:
             return True
     return False
 
+# ---------------------------------------------------------------------------
+# Multi-Tenant: payload parser & background worker
+# ---------------------------------------------------------------------------
+
+def parse_whatsapp_payload(data: dict) -> tuple[str | None, str | None, str]:
+    """Extract (phone_number, image_id, caption) from a raw Meta webhook payload.
+
+    Returns (None, None, "") when the payload contains no image message.
+    """
+    try:
+        entries = data.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                if "messages" not in value:
+                    continue
+                msg = value["messages"][0]
+                if msg.get("type") != "image":
+                    continue
+                phone_number = msg["from"]
+                image_id     = msg["image"]["id"]
+                caption      = msg["image"].get("caption", "No description provided.")
+                return phone_number, image_id, caption
+    except Exception as exc:
+        print(f"[parse_whatsapp_payload] ⚠️ Parse error: {exc}")
+    return None, None, ""
+
+
+def extract_audit_fields_with_ai(caption: str, image_bytes: bytes) -> dict:
+    """Call Gemini Vision AI to extract structured audit fields from an image.
+
+    Returns a dict with keys: floor, room, fault_description, severity.
+    Falls back to sensible defaults on any error.
+    """
+    import google.generativeai as genai
+
+    prompt = """You are a construction-site safety audit AI.
+Analyse the provided site photograph together with the caption below.
+
+Return ONLY a valid JSON object with exactly these four keys:
+{
+  "floor": "...",
+  "room": "...",
+  "fault_description": "...",
+  "severity": "Low | Medium | High | Critical"
+}
+
+Rules:
+- "floor": The floor number / name (e.g. "Ground Floor", "3rd Floor"). Use "Not specified" if unknown.
+- "room": The room or area (e.g. "Kitchen", "Master Bedroom", "Lobby"). Use "Not specified" if unknown.
+- "fault_description": A concise one-sentence description of the defect visible in the photo.
+- "severity": Choose the single most appropriate label — Low, Medium, High, or Critical.
+
+Do NOT include any location codes, unit numbers, or markdown fences in your response.
+
+Caption: "{caption}"
+""".format(caption=caption)
+
+    try:
+        import PIL.Image
+        import io as _io
+
+        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
+        response   = ai_model.generate_content([prompt, image_part])
+
+        # 1. Get raw text from Gemini response
+        raw_text = response.text.strip() if hasattr(response, "text") else str(response)
+
+        # 2. Strip leading/trailing markdown code fences (```json ... ```)
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+        raw_text = raw_text.strip()
+
+        # 3. Parse JSON safely with fallback dictionary
+        try:
+            data = json.loads(raw_text)
+        except Exception as json_exc:
+            print(f"[Gemini] JSON parsing failed: {json_exc}. Raw text was:\n{raw_text}")
+            data = {}
+
+        # 4. Extract fields safely using .get() with defaults
+        floor             = data.get("floor", "N/A")
+        room              = data.get("room", "N/A")
+        fault_description = data.get("fault_description", data.get("fault", "Site Fault Reported"))
+        severity          = data.get("severity", "Medium")
+
+        return {
+            "floor":             str(floor).strip()             or "Not specified",
+            "room":              str(room).strip()              or "Not specified",
+            "fault_description": str(fault_description).strip() or caption.strip(),
+            "severity":          str(severity).strip()          or "Medium",
+        }
+    except Exception as exc:
+        print(f"[extract_audit_fields_with_ai] ⚠️ AI error: {exc}")
+        return {
+            "floor":             "Not specified",
+            "room":              "Not specified",
+            "fault_description": caption.strip() or "No description provided.",
+            "severity":          "Medium",
+        }
+
+
+def process_site_report_job(
+    phone_number: str,
+    image_id: str,
+    caption: str,
+) -> None:
+    """Background worker — runs after the webhook has already returned 200.
+
+    Steps:
+      1. Get or create the caller's personal Google Sheet.
+      2. Download the site image from Meta's Graph API.
+      3. Call Gemini Vision AI (audit schema).
+      4. Upload image to Google Drive.
+      5. Append structured row to the caller's sheet.
+      6. Reply to the caller on WhatsApp.
+    """
+    print(f"[background] 🚀 Starting job for {phone_number}")
+
+    try:
+        # ── 1. Provision sheet ──────────────────────────────────────────
+        sheet_id, sheet_url = sheets_service.get_or_create_user_sheet(phone_number)
+
+        # ── 2. Download image ───────────────────────────────────────────
+        image_bytes = download_whatsapp_media(image_id)
+        print(f"[background] 📷 Image downloaded ({len(image_bytes)} bytes)")
+
+        # ── 3. Vision AI — extract audit fields ─────────────────────────
+        # Safe defaults — used as-is if Gemini call or JSON parsing fails.
+        user_caption     = caption.strip() if caption and caption.strip() else "Site Fault Logged"
+        floor            = "N/A"
+        room             = "N/A"
+        fault            = user_caption
+        severity         = "Medium"
+
+        try:
+            audit = extract_audit_fields_with_ai(caption, image_bytes)
+
+            # Overwrite defaults only when the helper returned real values
+            floor    = audit.get("floor")    or floor
+            room     = audit.get("room")     or room
+            fault    = audit.get("fault_description") or audit.get("fault") or fault
+            severity = audit.get("severity") or severity
+
+        except Exception as parse_error:
+            print(f"[background] ⚠️ Gemini JSON parsing skipped/failed: {parse_error}. Using fallback defaults.")
+
+        # Ensure all fields are populated strings before writing to the sheet
+        row_data = {
+            "floor":             str(floor),
+            "room":              str(room),
+            "fault_description": str(fault),
+            "severity":          str(severity),
+        }
+
+        # ── 4. Upload image to Google Drive ─────────────────────────────
+        _, drive_service = get_google_services()
+        filename   = f"Site_Fault_{phone_number}_{int(datetime.datetime.now().timestamp())}.jpg"
+        drive_link = upload_to_drive(drive_service, image_bytes, filename)
+        print(f"[background] ☁️  Drive upload: {drive_link}")
+
+        # ── 5. Append audit row to the user's sheet ──────────────────────
+        timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            timestamp,
+            row_data["floor"],
+            row_data["room"],
+            row_data["fault_description"],
+            row_data["severity"],
+            drive_link,
+        ]
+        sheets_service.append_audit_row(sheet_id, row)
+
+        # ── 6. WhatsApp confirmation ─────────────────────────────────────
+        reply = (
+            "✅ *Site Fault Logged Successfully!*\n\n"
+            "📋 *Extracted Details:*\n"
+            f"• *Floor:* {row_data['floor']}\n"
+            f"• *Room:* {row_data['room']}\n"
+            f"• *Fault:* {row_data['fault_description']}\n"
+            f"• *Severity:* {row_data['severity']}\n\n"
+            f"🔗 *View your live dynamic log sheet here:*\n{sheet_url}"
+        )
+        send_whatsapp_message(phone_number, reply)
+        print(f"[background] ✅ Job completed for {phone_number}")
+
+    except Exception as exc:
+        print(f"[background] ❌ Job failed for {phone_number}: {exc}")
+        try:
+            send_whatsapp_message(
+                phone_number,
+                "⚠️ We encountered an issue processing your report. Please try again."
+            )
+        except Exception:
+            pass
+
+
 # --- WEBHOOK ROUTES ---
 @app.get("/")
 @app.head("/")
@@ -256,260 +458,239 @@ async def verify_webhook(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 @app.post("/webhook")
-async def receive_message(request: Request):
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """WhatsApp POST webhook — returns 200 in < 100 ms.
+
+    Heavy operations (image download, Vision AI, Drive upload, Sheet logging,
+    WhatsApp reply) are delegated to a FastAPI BackgroundTask so that Meta's
+    5-second HTTP timeout is never breached.
+
+    Text messages and state-machine commands are still handled synchronously
+    here because they consist only of fast MongoDB reads/writes.
+    """
     try:
         body = await request.json()
 
-        if body.get("object") == "whatsapp_business_account":
-            for entry in body.get("entry", []):
-                for change in entry.get("changes", []):
-                    value = change.get("value", {})
+        if body.get("object") != "whatsapp_business_account":
+            return {"status": "ok"}
 
-                    if "messages" in value:
-                        msg = value["messages"][0]
-                        sender_phone = msg["from"]
-                        msg_type = msg["type"]
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
 
-                        # Check Engineer Registry for auto-name setup
-                        registered_engineer = engineers_collection.find_one({"phone": sender_phone})
-                        auto_name = registered_engineer.get("name", "") if registered_engineer else ""
+                if "messages" not in value:
+                    continue
 
-                        # Fetch or Create User
-                        user = users_collection.find_one({"phone": sender_phone})
-                        if not user:
-                            initial_state = "awaiting_project" if auto_name else "awaiting_name"
-                            user = {
-                                "phone": sender_phone,
-                                "state": initial_state,
-                                "return_state": None,
-                                "name": auto_name,
-                                "project": "",
-                                "site": ""
-                            }
-                            users_collection.insert_one(user)
+                msg          = value["messages"][0]
+                sender_phone = msg["from"]
+                msg_type     = msg["type"]
 
-                            if auto_name:
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    f"👋 Welcome back, *{auto_name}*!\n\n🏢 Please reply with your *Project Name* (e.g., Vector Heights)."
-                                )
-                            else:
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    "👋 Welcome to the Site Tracker!\n\nTo get started, please reply with your *Full Name*."
-                                )
-                            return {"status": "success"}
+                # Check Engineer Registry for auto-name setup
+                registered_engineer = engineers_collection.find_one({"phone": sender_phone})
+                auto_name = registered_engineer.get("name", "") if registered_engineer else ""
 
-                        # --- HANDLE COMMANDS & TEXT MESSAGES ---
-                        if msg_type == "text":
-                            user_text = msg["text"]["body"].strip()
-                            cmd = user_text.lower()
+                # Fetch or Create User
+                user = users_collection.find_one({"phone": sender_phone})
+                if not user:
+                    initial_state = "awaiting_project" if auto_name else "awaiting_name"
+                    user = {
+                        "phone": sender_phone,
+                        "state": initial_state,
+                        "return_state": None,
+                        "name": auto_name,
+                        "project": "",
+                        "site": ""
+                    }
+                    users_collection.insert_one(user)
 
-                            # --- NEW: ADMIN /ADD_USER COMMAND ---
-                            if cmd.startswith("/add_user"):
-                                if sender_phone not in ADMIN_NUMBERS:
-                                    send_whatsapp_message(sender_phone, "⛔ You do not have permission to use admin commands.")
-                                    return {"status": "success"}
+                    if auto_name:
+                        send_whatsapp_message(
+                            sender_phone,
+                            f"👋 Welcome back, *{auto_name}*!\n\n🏢 Please reply with your *Project Name* (e.g., Vector Heights)."
+                        )
+                    else:
+                        send_whatsapp_message(
+                            sender_phone,
+                            "👋 Welcome to the Site Tracker!\n\nTo get started, please reply with your *Full Name*."
+                        )
+                    return {"status": "ok"}
 
-                                # Parse the command: /add_user 919876543210 John Doe
-                                parts = user_text.split(" ", 2)
-                                if len(parts) < 3:
-                                    send_whatsapp_message(sender_phone, "⚠️ Invalid format.\nUse: */add_user [Phone] [Name]*\nExample: `/add_user 919876543210 John Doe`")
-                                    return {"status": "success"}
+                # --- HANDLE COMMANDS & TEXT MESSAGES (synchronous — fast DB ops only) ---
+                if msg_type == "text":
+                    user_text = msg["text"]["body"].strip()
+                    cmd = user_text.lower()
 
-                                new_phone = parts[1].strip()
-                                new_name = parts[2].strip()
+                    # --- ADMIN /ADD_USER COMMAND ---
+                    if cmd.startswith("/add_user"):
+                        if sender_phone not in ADMIN_NUMBERS:
+                            send_whatsapp_message(sender_phone, "⛔ You do not have permission to use admin commands.")
+                            return {"status": "ok"}
 
-                                # Add/update in engineers database
-                                engineers_collection.update_one(
-                                    {"phone": new_phone},
-                                    {"$set": {"name": new_name}},
-                                    upsert=True
-                                )
-                                
-                                # If they already texted the bot before being added, update their active profile too
-                                users_collection.update_one(
-                                    {"phone": new_phone},
-                                    {"$set": {"name": new_name}}
-                                )
+                        parts = user_text.split(" ", 2)
+                        if len(parts) < 3:
+                            send_whatsapp_message(sender_phone, "⚠️ Invalid format.\nUse: */add_user [Phone] [Name]*\nExample: `/add_user 919876543210 John Doe`")
+                            return {"status": "ok"}
 
-                                send_whatsapp_message(sender_phone, f"✅ *{new_name}* ({new_phone}) has been registered to the engineer database.")
-                                return {"status": "success"}
-                            # ------------------------------------
+                        new_phone = parts[1].strip()
+                        new_name  = parts[2].strip()
 
-                            # Command: /reset or /start
-                            if cmd in ("/reset", "/start"):
-                                new_state = "awaiting_project" if auto_name else "awaiting_name"
-                                users_collection.update_one(
-                                    {"phone": sender_phone},
-                                    {"$set": {"state": new_state, "return_state": None, "name": auto_name, "project": "", "site": ""}}
-                                )
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    "🧹 *Session Reset Complete.*\n\n" + 
-                                    (f"Welcome, *{auto_name}*! 🏢 What is your *Project Name*?" if auto_name else "✏️ What is your *Full Name*?")
-                                )
-                                return {"status": "success"}
+                        engineers_collection.update_one(
+                            {"phone": new_phone},
+                            {"$set": {"name": new_name}},
+                            upsert=True
+                        )
+                        users_collection.update_one(
+                            {"phone": new_phone},
+                            {"$set": {"name": new_name}}
+                        )
+                        send_whatsapp_message(sender_phone, f"✅ *{new_name}* ({new_phone}) has been registered to the engineer database.")
+                        return {"status": "ok"}
 
-                            # Command: /status
-                            if cmd == "/status":
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    f"📋 *Current Profile Status:*\n\n"
-                                    f"👤 *Name:* {display_name(user)}\n"
-                                    f"🏢 *Project:* {user.get('project') or 'Not set'}\n"
-                                    f"📍 *Site:* {user.get('site') or 'Not set'}\n"
-                                    f"🔄 *Status:* {user.get('state')}\n\n"
-                                    f"Commands: /update (Change Site), /name (Change Name), /reset (Start Over)"
-                                )
-                                return {"status": "success"}
+                    # Command: /reset or /start
+                    if cmd in ("/reset", "/start"):
+                        new_state = "awaiting_project" if auto_name else "awaiting_name"
+                        users_collection.update_one(
+                            {"phone": sender_phone},
+                            {"$set": {"state": new_state, "return_state": None, "name": auto_name, "project": "", "site": ""}}
+                        )
+                        send_whatsapp_message(
+                            sender_phone,
+                            "🧹 *Session Reset Complete.*\n\n" +
+                            (f"Welcome, *{auto_name}*! 🏢 What is your *Project Name*?" if auto_name else "✏️ What is your *Full Name*?")
+                        )
+                        return {"status": "ok"}
 
-                            # Command: /help
-                            if cmd == "/help":
-                                help_msg = (
-                                    "🛠 *Available Commands:*\n\n"
-                                    "• */status* - Show your active profile settings\n"
-                                    "• */update* - Change your Project & Site Location\n"
-                                    "• */name* - Update your registered Name\n"
-                                    "• */reset* or */start* - Clear session and start setup over\n"
-                                    "• Send a *Photo + Caption* to log a fault report"
-                                )
-                                if sender_phone in ADMIN_NUMBERS:
-                                    help_msg += "\n\n👑 *Admin Commands:*\n• */add_user [Phone] [Name]* - Register a new engineer"
-                                    
-                                send_whatsapp_message(sender_phone, help_msg)
-                                return {"status": "success"}
+                    # Command: /status
+                    if cmd == "/status":
+                        send_whatsapp_message(
+                            sender_phone,
+                            f"📋 *Current Profile Status:*\n\n"
+                            f"👤 *Name:* {display_name(user)}\n"
+                            f"🏢 *Project:* {user.get('project') or 'Not set'}\n"
+                            f"📍 *Site:* {user.get('site') or 'Not set'}\n"
+                            f"🔄 *Status:* {user.get('state')}\n\n"
+                            f"Commands: /update (Change Site), /name (Change Name), /reset (Start Over)"
+                        )
+                        return {"status": "ok"}
 
-                            # Command: /update
-                            if cmd == "/update":
-                                users_collection.update_one(
-                                    {"phone": sender_phone},
-                                    {"$set": {"state": "awaiting_project", "return_state": None}}
-                                )
-                                send_whatsapp_message(sender_phone, "🔄 Location update initiated.\n\n🏢 What is the new *Project Name*?")
-                                return {"status": "success"}
+                    # Command: /help
+                    if cmd == "/help":
+                        help_msg = (
+                            "🛠 *Available Commands:*\n\n"
+                            "• */status* - Show your active profile settings\n"
+                            "• */update* - Change your Project & Site Location\n"
+                            "• */name* - Update your registered Name\n"
+                            "• */reset* or */start* - Clear session and start setup over\n"
+                            "• Send a *Photo + Caption* to log a fault report"
+                        )
+                        if sender_phone in ADMIN_NUMBERS:
+                            help_msg += "\n\n👑 *Admin Commands:*\n• */add_user [Phone] [Name]* - Register a new engineer"
+                        send_whatsapp_message(sender_phone, help_msg)
+                        return {"status": "ok"}
 
-                            # Command: /name
-                            if cmd == "/name":
-                                users_collection.update_one(
-                                    {"phone": sender_phone},
-                                    {"$set": {"state": "awaiting_name", "return_state": "active"}}
-                                )
-                                send_whatsapp_message(sender_phone, "✏️ What should we log your name as?")
-                                return {"status": "success"}
+                    # Command: /update
+                    if cmd == "/update":
+                        users_collection.update_one(
+                            {"phone": sender_phone},
+                            {"$set": {"state": "awaiting_project", "return_state": None}}
+                        )
+                        send_whatsapp_message(sender_phone, "🔄 Location update initiated.\n\n🏢 What is the new *Project Name*?")
+                        return {"status": "ok"}
 
-                            # Setup States
-                            if user["state"] == "awaiting_name":
-                                return_state = user.get("return_state")
-                                if return_state == "active":
-                                    users_collection.update_one(
-                                        {"phone": sender_phone},
-                                        {"$set": {"name": user_text, "state": "active", "return_state": None}}
-                                    )
-                                    send_whatsapp_message(sender_phone, f"✅ Name updated to *{user_text}*.")
-                                else:
-                                    users_collection.update_one(
-                                        {"phone": sender_phone},
-                                        {"$set": {"name": user_text, "state": "awaiting_project"}}
-                                    )
-                                    send_whatsapp_message(sender_phone, f"Thanks, *{user_text}*.\n\n🏢 What is your *Project Name*?")
-                                return {"status": "success"}
+                    # Command: /name
+                    if cmd == "/name":
+                        users_collection.update_one(
+                            {"phone": sender_phone},
+                            {"$set": {"state": "awaiting_name", "return_state": "active"}}
+                        )
+                        send_whatsapp_message(sender_phone, "✏️ What should we log your name as?")
+                        return {"status": "ok"}
 
-                            if user["state"] == "awaiting_project":
-                                return_state = user.get("return_state")
-                                if return_state == "active":
-                                    users_collection.update_one(
-                                        {"phone": sender_phone},
-                                        {"$set": {"project": user_text, "state": "active", "return_state": None}}
-                                    )
-                                    send_whatsapp_message(sender_phone, f"✅ Project updated to *{user_text}*.")
-                                else:
-                                    users_collection.update_one(
-                                        {"phone": sender_phone},
-                                        {"$set": {"project": user_text, "state": "awaiting_site"}}
-                                    )
-                                    send_whatsapp_message(sender_phone, f"Got it. Project: *{user_text}*.\n\n📍 What is the *Site Location*? (e.g., Tower B)")
-                                return {"status": "success"}
-
-                            elif user["state"] == "awaiting_site":
-                                users_collection.update_one(
-                                    {"phone": sender_phone},
-                                    {"$set": {"site": user_text, "state": "active", "return_state": None}}
-                                )
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    "✅ *Setup Complete!*\n\n"
-                                    "Send any photo with a caption to log a fault report.\n"
-                                    "Type */help* for a list of commands."
-                                )
-                                return {"status": "success"}
-
-                            elif user["state"] == "active":
-                                if start_missing_field_collection(sender_phone, user):
-                                    return {"status": "success"}
-
-                                send_whatsapp_message(
-                                    sender_phone,
-                                    "📸 Please attach a photo when reporting a fault. Type the fault description in the photo caption!\n\n"
-                                    "*(Type /help to see commands)*"
-                                )
-                                return {"status": "success"}
-
-                        # --- HANDLE IMAGES ---
-                        elif msg_type == "image":
-                            if user["state"] != "active":
-                                send_whatsapp_message(sender_phone, "⚠️ Please complete setup first before sending photos.")
-                                return {"status": "success"}
-
-                            if start_missing_field_collection(sender_phone, user):
-                                send_whatsapp_message(sender_phone, "Please resend the photo once you've replied above.")
-                                return {"status": "success"}
-
-                            image_id = msg["image"]["id"]
-                            caption = msg["image"].get("caption", "No description provided.")
-
-                            send_whatsapp_message(sender_phone, "⏳ Processing report...")
-
-                            ai_data = extract_fault_details_with_ai(caption)
-
-                            _, drive_service = get_google_services()
-                            image_bytes = download_whatsapp_media(image_id)
-                            filename = f"Site_Fault_{sender_phone}_{int(datetime.datetime.now().timestamp())}.jpg"
-                            drive_link = upload_to_drive(drive_service, image_bytes, filename)
-
-                            # Column order matches Google Sheet headers:
-                            # Timestamp | Phone Number | Project Name | Site Location | Name | Fault Location | Fault Description | Photo Link | Status
-                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            row_data = [
-                                timestamp,
-                                sender_phone,
-                                user["project"],
-                                user["site"],
-                                display_name(user),
-                                ai_data["specific_area"],
-                                ai_data["fault_description"],
-                                drive_link,
-                                "Pending Review"
-                            ]
-                            sheet_link = log_to_sheet(row_data)
-
-                            reply_msg = (
-                                f"✅ *Report Logged!*\n\n"
-                                f"👤 *Logged by:* {display_name(user)}\n"
-                                f"🏢 *Project:* {user['project']}\n"
-                                f"📍 *Site:* {user['site']}\n"
-                                f"🚪 *Fault Location:* {ai_data['specific_area']}\n"
-                                f"⚠️ *Fault Description:* {ai_data['fault_description']}\n\n"
-                                f"📸 *Photo:* {drive_link}\n"
-                                f"📋 *Report Sheet:* {sheet_link}"
+                    # Setup States
+                    if user["state"] == "awaiting_name":
+                        return_state = user.get("return_state")
+                        if return_state == "active":
+                            users_collection.update_one(
+                                {"phone": sender_phone},
+                                {"$set": {"name": user_text, "state": "active", "return_state": None}}
                             )
-                            send_whatsapp_message(sender_phone, reply_msg)
+                            send_whatsapp_message(sender_phone, f"✅ Name updated to *{user_text}*.")
+                        else:
+                            users_collection.update_one(
+                                {"phone": sender_phone},
+                                {"$set": {"name": user_text, "state": "awaiting_project"}}
+                            )
+                            send_whatsapp_message(sender_phone, f"Thanks, *{user_text}*.\n\n🏢 What is your *Project Name*?")
+                        return {"status": "ok"}
 
-        return {"status": "success"}
+                    if user["state"] == "awaiting_project":
+                        return_state = user.get("return_state")
+                        if return_state == "active":
+                            users_collection.update_one(
+                                {"phone": sender_phone},
+                                {"$set": {"project": user_text, "state": "active", "return_state": None}}
+                            )
+                            send_whatsapp_message(sender_phone, f"✅ Project updated to *{user_text}*.")
+                        else:
+                            users_collection.update_one(
+                                {"phone": sender_phone},
+                                {"$set": {"project": user_text, "state": "awaiting_site"}}
+                            )
+                            send_whatsapp_message(sender_phone, f"Got it. Project: *{user_text}*.\n\n📍 What is the *Site Location*? (e.g., Tower B)")
+                        return {"status": "ok"}
 
-    except Exception as e:
-        print(f"❌ Error handling payload: {e}")
-        return {"status": "error"}
+                    elif user["state"] == "awaiting_site":
+                        users_collection.update_one(
+                            {"phone": sender_phone},
+                            {"$set": {"site": user_text, "state": "active", "return_state": None}}
+                        )
+                        send_whatsapp_message(
+                            sender_phone,
+                            "✅ *Setup Complete!*\n\n"
+                            "Send any photo with a caption to log a fault report.\n"
+                            "Type */help* for a list of commands."
+                        )
+                        return {"status": "ok"}
+
+                    elif user["state"] == "active":
+                        if start_missing_field_collection(sender_phone, user):
+                            return {"status": "ok"}
+                        send_whatsapp_message(
+                            sender_phone,
+                            "📸 Please attach a photo when reporting a fault. Type the fault description in the photo caption!\n\n"
+                            "*(Type /help to see commands)*"
+                        )
+                        return {"status": "ok"}
+
+                # --- HANDLE IMAGES (delegated to background) ---
+                elif msg_type == "image":
+                    if user["state"] != "active":
+                        send_whatsapp_message(sender_phone, "⚠️ Please complete setup first before sending photos.")
+                        return {"status": "ok"}
+
+                    if start_missing_field_collection(sender_phone, user):
+                        send_whatsapp_message(sender_phone, "Please resend the photo once you've replied above.")
+                        return {"status": "ok"}
+
+                    image_id = msg["image"]["id"]
+                    caption  = msg["image"].get("caption", "No description provided.")
+
+                    # Acknowledge immediately so the user knows we received it
+                    send_whatsapp_message(sender_phone, "⏳ *Report received!* Processing in the background — we'll send your live sheet link shortly.")
+
+                    # Offload ALL heavy work to a background task
+                    background_tasks.add_task(
+                        process_site_report_job,
+                        phone_number=sender_phone,
+                        image_id=image_id,
+                        caption=caption,
+                    )
+
+        return {"status": "ok"}
+
+    except Exception as exc:
+        print(f"❌ Webhook error: {exc}")
+        return {"status": "ok"}   # Always return 200 to Meta
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
