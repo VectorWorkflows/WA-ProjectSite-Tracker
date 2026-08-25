@@ -112,7 +112,7 @@ Every engineer gets their own private, permanent, always-current fault log. Ever
 <br />
 
 ## ▍ Get it running
-
+(NOTE: YOU'LL NEED TO HAVE A TEST OR DEDICATED NUMBER LINKED TO THE BOT ON META DEVELOPERS PAGE, CONTACT FOR THE ENTIRE CUSTOM BUILD)
 ```bash
 # 1 — clone
 git clone https://github.com/VectorWorkflows/WA-ProjectSite-Tracker.git
